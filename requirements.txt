@@ -1,0 +1,7 @@
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
+python-dotenv==1.0.0
+huggingface-hub>=0.25.0
+pillow==10.0.1
+pymongo[srv]==4.4.0
+
