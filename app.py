@@ -1,9 +1,10 @@
 import os
 import io
 import traceback
+from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -30,8 +31,6 @@ if not MONGODB_URI:
 
 # ---------------------------------------------------------------------
 # Initialize Hugging Face Inference client
-# (provider parameter only supported on Hugging Face Spaces)
-# For local, just use the standard client
 # ---------------------------------------------------------------------
 hf_client = InferenceClient(token=HF_TOKEN)
 
@@ -39,11 +38,12 @@ hf_client = InferenceClient(token=HF_TOKEN)
 # Initialize MongoDB connection + GridFS
 # ---------------------------------------------------------------------
 mongo = MongoClient(MONGODB_URI)
-db = mongo[DB_NAME]  # explicitly select DB
+db = mongo[DB_NAME]
 fs = gridfs.GridFS(db)
+logs_collection = db["logs"]
 
 # ---------------------------------------------------------------------
-# Create FastAPI app
+# FastAPI app setup
 # ---------------------------------------------------------------------
 app = FastAPI(title="Flux/FAL Image Inference Service")
 
@@ -55,6 +55,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------
+BEARER_TOKEN = "logicgo@123"
+
+
+def verify_token(authorization: str = Header(None)):
+    """Simple bearer token verification."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    token = authorization.split(" ")[1]
+    if token != BEARER_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid bearer token.")
+    return True
+
 
 # ---------------------------------------------------------------------
 # Models and Endpoints
@@ -76,11 +92,18 @@ def health():
 
 
 @app.post("/generate")
-async def generate(prompt: str = Form(...), file: UploadFile = File(...)):
+async def generate(
+    prompt: str = Form(...),
+    file: UploadFile = File(...),
+    authorized: bool = Depends(verify_token)
+):
     """
     Upload an image and a prompt, get back an output image stored in MongoDB GridFS.
-    Returns the output image's ID.
+    Requires Bearer token for access.
     """
+    # ---------------------------
+    # 1. Read input image
+    # ---------------------------
     try:
         input_bytes = await file.read()
         if not input_bytes:
@@ -88,14 +111,18 @@ async def generate(prompt: str = Form(...), file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed reading upload: {e}")
 
-    # Save input image to DB
+    # ---------------------------
+    # 2. Save input image to GridFS
+    # ---------------------------
     try:
         input_meta = {"filename": file.filename, "contentType": file.content_type, "role": "input"}
         input_id = fs.put(input_bytes, **input_meta)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed saving input image: {e}")
 
-    # Run inference (image editing)
+    # ---------------------------
+    # 3. Run inference
+    # ---------------------------
     try:
         pil_result = hf_client.image_to_image(
             image=input_bytes,
@@ -116,7 +143,9 @@ async def generate(prompt: str = Form(...), file: UploadFile = File(...)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Inference failed: {e}")
 
-    # Save output image
+    # ---------------------------
+    # 4. Save output image
+    # ---------------------------
     try:
         out_meta = {
             "filename": f"result_{input_id}.png",
@@ -129,6 +158,22 @@ async def generate(prompt: str = Form(...), file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed saving output image: {e}")
 
+    # ---------------------------
+    # 5. Log the operation
+    # ---------------------------
+    try:
+        logs_collection.insert_one({
+            "timestamp": datetime.utcnow(),
+            "input_image_id": str(input_id),
+            "output_image_id": str(out_id),
+            "prompt": prompt,
+        })
+    except Exception as e:
+        print("⚠️ Failed to write log:", e)
+
+    # ---------------------------
+    # 6. Return response
+    # ---------------------------
     return JSONResponse({"output_id": str(out_id)})
 
 
@@ -162,7 +207,7 @@ def root():
 
 
 # ---------------------------------------------------------------------
-# Run the FastAPI app locally (no Docker needed)
+# Run the FastAPI app locally
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
