@@ -4,7 +4,10 @@ import traceback
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depends
+from fastapi import (
+    FastAPI, File, UploadFile, Form,
+    HTTPException, Security
+)
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,9 +17,10 @@ from pymongo import MongoClient
 import gridfs
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 # ---------------------------------------------------------------------
-# Load .env (for local development)
+# Load environment variables
 # ---------------------------------------------------------------------
 load_dotenv()
 
@@ -43,11 +47,16 @@ fs = gridfs.GridFS(db)
 logs_collection = db["logs"]
 
 # ---------------------------------------------------------------------
-# FastAPI app setup
+# FastAPI setup
 # ---------------------------------------------------------------------
-app = FastAPI(title="Flux/FAL Image Inference Service")
+app = FastAPI(
+    title="Polaroid AI Generator",
+    description="Upload an image + prompt to generate a styled version. "
+                "Use the **Authorize 🔒** button to provide your API token before generating.",
+    version="1.0.0"
+)
 
-# Enable CORS (for local testing)
+# Enable CORS (for local & HF Spaces)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -57,30 +66,31 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------
-# Authentication
+# Authentication setup (with Swagger integration)
 # ---------------------------------------------------------------------
 BEARER_TOKEN = "logicgo@123"
+security_scheme = HTTPBearer(auto_error=False)
 
-
-def verify_token(authorization: str = Header(None)):
-    """Simple bearer token verification."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
-    token = authorization.split(" ")[1]
+def verify_token(credentials: HTTPAuthorizationCredentials = Security(security_scheme)):
+    """Bearer token verification (used in Swagger UI too)."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Missing Authorization header.")
+    token = credentials.credentials
     if token != BEARER_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid bearer token.")
     return True
 
-
 # ---------------------------------------------------------------------
-# Models and Endpoints
+# Models
 # ---------------------------------------------------------------------
 class HealthResponse(BaseModel):
     status: str
     hf_provider: str
     db: str
 
-
+# ---------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------
 @app.get("/health", response_model=HealthResponse)
 def health():
     """Health check endpoint."""
@@ -95,15 +105,13 @@ def health():
 async def generate(
     prompt: str = Form(...),
     file: UploadFile = File(...),
-    authorized: bool = Depends(verify_token)
+    authorized: bool = Security(verify_token)
 ):
     """
-    Upload an image and a prompt, get back an output image stored in MongoDB GridFS.
-    Requires Bearer token for access.
+    Upload an image and prompt -> get AI-edited image.
+    Requires Bearer token auth.
     """
-    # ---------------------------
-    # 1. Read input image
-    # ---------------------------
+    # 1️⃣ Read input file
     try:
         input_bytes = await file.read()
         if not input_bytes:
@@ -111,18 +119,14 @@ async def generate(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed reading upload: {e}")
 
-    # ---------------------------
-    # 2. Save input image to GridFS
-    # ---------------------------
+    # 2️⃣ Save input to GridFS
     try:
         input_meta = {"filename": file.filename, "contentType": file.content_type, "role": "input"}
         input_id = fs.put(input_bytes, **input_meta)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed saving input image: {e}")
 
-    # ---------------------------
-    # 3. Run inference
-    # ---------------------------
+    # 3️⃣ Run inference
     try:
         pil_result = hf_client.image_to_image(
             image=input_bytes,
@@ -143,9 +147,7 @@ async def generate(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Inference failed: {e}")
 
-    # ---------------------------
-    # 4. Save output image
-    # ---------------------------
+    # 4️⃣ Save output image
     try:
         out_meta = {
             "filename": f"result_{input_id}.png",
@@ -158,9 +160,7 @@ async def generate(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed saving output image: {e}")
 
-    # ---------------------------
-    # 5. Log the operation
-    # ---------------------------
+    # 5️⃣ Log operation
     try:
         logs_collection.insert_one({
             "timestamp": datetime.utcnow(),
@@ -171,9 +171,7 @@ async def generate(
     except Exception as e:
         print("⚠️ Failed to write log:", e)
 
-    # ---------------------------
-    # 6. Return response
-    # ---------------------------
+    # 6️⃣ Return result
     return JSONResponse({"output_id": str(out_id)})
 
 
@@ -203,8 +201,10 @@ def get_image(image_id: str, download: Optional[bool] = False):
 @app.get("/")
 def root():
     """Simple root route for status."""
-    return {"message": "Image inference service running", "routes": ["/health", "/generate", "/image/{id}"]}
-
+    return {
+        "message": "Polaroid Image Generator API running ✅",
+        "routes": ["/health", "/generate", "/image/{id}"]
+    }
 
 # ---------------------------------------------------------------------
 # Run the FastAPI app locally
