@@ -4,3 +4,4 @@ python-dotenv==1.0.0
 huggingface-hub>=0.25.0
 pillow==11.0.0
 pymongo[srv]==4.4.0
+python-multipart
